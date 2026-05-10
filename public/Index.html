@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Messaging App</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #121212; color: white; padding: 20px; }
+        .container { max-width: 500px; margin: auto; background: #1e1e1e; padding: 20px; border-radius: 10px; }
+        input, button { width: 100%; padding: 12px; margin: 8px 0; border: none; border-radius: 5px; }
+        button { background: #4CAF50; color: white; cursor: pointer; font-size: 16px; }
+        button:hover { background: #45a049; }
+        .message { background: #2c2c2c; padding: 10px; margin: 5px 0; border-radius: 5px; }
+        .my-message { background: #4CAF50; text-align: right; }
+        #chatArea { display: none; }
+        #messages { height: 400px; overflow-y: auto; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container" id="loginArea">
+        <h2>Login or Register</h2>
+        <input type="text" id="loginId" placeholder="5-digit ID (for login)">
+        <input type="text" id="name" placeholder="Your Name (for registration)">
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="register()">Register (Get New 5-digit ID)</button>
+        <button onclick="login()">Login</button>
+        <div id="message"></div>
+    </div>
+
+    <div class="container" id="chatArea">
+        <h3>Welcome, <span id="userName"></span> (ID: <span id="userId"></span>)</h3>
+        <input type="text" id="recipientId" placeholder="Recipient's 5-digit ID">
+        <div id="messages"></div>
+        <input type="text" id="messageInput" placeholder="Type message...">
+        <button onclick="sendMessage()">Send</button>
+        <button onclick="logout()">Logout</button>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        let socket, currentUser;
+
+        async function register() {
+            const name = document.getElementById('name').value;
+            const password = document.getElementById('password').value;
+            const res = await fetch('/api/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, password })
+            });
+            const data = await res.json();
+            if(data.success) {
+                document.getElementById('message').innerHTML = `✅ Your 5-digit ID: <strong>${data.uniqueId}</strong>. Save it! Now login.`;
+            }
+        }
+
+        async function login() {
+            const uniqueId = document.getElementById('loginId').value;
+            const password = document.getElementById('password').value;
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uniqueId, password })
+            });
+            const data = await res.json();
+            if(data.success) {
+                localStorage.setItem('token', data.token);
+                currentUser = data;
+                document.getElementById('loginArea').style.display = 'none';
+                document.getElementById('chatArea').style.display = 'block';
+                document.getElementById('userName').innerText = data.name;
+                document.getElementById('userId').innerText = data.uniqueId;
+                connectSocket();
+                loadMessages();
+            } else {
+                alert('Login failed');
+            }
+        }
+
+        function connectSocket() {
+            const token = localStorage.getItem('token');
+            socket = io({ auth: { token } });
+            socket.on('receive-message', (msg) => {
+                displayMessage(msg.fromId, msg.message, false);
+            });
+        }
+
+        async function loadMessages() {
+            const toId = document.getElementById('recipientId').value;
+            if(!toId) return;
+            const token = localStorage.getItem('token');
+            const res = await fetch('/api/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                body: JSON.stringify({ fromId: currentUser.uniqueId, toId })
+            });
+            const messages = await res.json();
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.innerHTML = '';
+            messages.forEach(msg => {
+                displayMessage(msg.fromId, msg.message, msg.fromId === currentUser.uniqueId);
+            });
+        }
+
+        function sendMessage() {
+            const toId = document.getElementById('recipientId').value;
+            const message = document.getElementById('messageInput').value;
+            if(!toId || !message) return;
+            socket.emit('send-message', { toId, message });
+            displayMessage(currentUser.uniqueId, message, true);
+            document.getElementById('messageInput').value = '';
+        }
+
+        function displayMessage(senderId, message, isMine) {
+            const messagesDiv = document.getElementById('messages');
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `message ${isMine ? 'my-message' : ''}`;
+            msgDiv.innerHTML = `<strong>${senderId}:</strong> ${message}`;
+            messagesDiv.appendChild(msgDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function logout() {
+            localStorage.removeItem('token');
+            location.reload();
+        }
+    </script>
+</body>
+</html>

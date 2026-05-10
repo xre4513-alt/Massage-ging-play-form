@@ -10,7 +10,8 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 const io = socketio(server, {
-  cors: { origin: "*" }
+  cors: { origin: "*" },
+  transports: ['websocket', 'polling']
 });
 
 app.use(cors());
@@ -18,16 +19,16 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => console.log('MongoDB connected'));
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.log('❌ MongoDB error:', err));
 
 // User Schema
 const UserSchema = new mongoose.Schema({
   uniqueId: { type: String, required: true, unique: true },
   name: { type: String, required: true },
-  password: { type: String, required: true }
+  password: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -50,53 +51,96 @@ async function generateUniqueId() {
   return id;
 }
 
-// Register API
+// ============ API ROUTES ============
+
+// Register
 app.post('/api/register', async (req, res) => {
-  const { name, password } = req.body;
-  const uniqueId = await generateUniqueId();
-  const hashedPassword = await bcrypt.hash(password, 10);
-  const user = new User({ uniqueId, name, password: hashedPassword });
-  await user.save();
-  res.json({ success: true, uniqueId });
-});
-
-// Login API
-app.post('/api/login', async (req, res) => {
-  const { uniqueId, password } = req.body;
-  const user = await User.findOne({ uniqueId });
-  if (!user || !(await bcrypt.compare(password, user.password))) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-  const token = jwt.sign({ uniqueId, name: user.name }, process.env.JWT_SECRET);
-  res.json({ success: true, token, uniqueId, name: user.name });
-});
-
-// Get user info (protected)
-app.get('/api/user', async (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
   try {
+    const { name, password } = req.body;
+    if (!name || !password) {
+      return res.status(400).json({ error: 'Name and password required' });
+    }
+    const uniqueId = await generateUniqueId();
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({ uniqueId, name, password: hashedPassword });
+    await user.save();
+    res.json({ success: true, uniqueId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  try {
+    const { uniqueId, password } = req.body;
+    const user = await User.findOne({ uniqueId });
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) {
+      return res.status(401).json({ error: 'Wrong password' });
+    }
+    const token = jwt.sign({ uniqueId, name: user.name }, process.env.JWT_SECRET);
+    res.json({ success: true, token, uniqueId, name: user.name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all users (except current)
+app.get('/api/all-users', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token' });
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    res.json({ uniqueId: decoded.uniqueId, name: decoded.name });
-  } catch {
+    const users = await User.find({ uniqueId: { $ne: decoded.uniqueId } }, 'uniqueId name');
+    res.json(users);
+  } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
   }
 });
 
 // Get messages between two users
 app.post('/api/messages', async (req, res) => {
-  const { fromId, toId } = req.body;
-  const messages = await Message.find({
-    $or: [
-      { fromId, toId },
-      { fromId: toId, toId: fromId }
-    ]
-  }).sort('timestamp');
-  res.json(messages);
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token' });
+    jwt.verify(token, process.env.JWT_SECRET);
+    
+    const { fromId, toId } = req.body;
+    const messages = await Message.find({
+      $or: [
+        { fromId, toId },
+        { fromId: toId, toId: fromId }
+      ]
+    }).sort('timestamp');
+    res.json(messages);
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
 });
 
-// Socket.io
-const users = {}; // socketId -> user data
+// Save message
+app.post('/api/save-message', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token' });
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    const { toId, message } = req.body;
+    const newMsg = new Message({ fromId: decoded.uniqueId, toId, message });
+    await newMsg.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// ============ SOCKET.IO ============
+const onlineUsers = new Map(); // uniqueId -> socket.id
+
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) return next(new Error('No token'));
@@ -110,8 +154,8 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  users[socket.id] = socket.user;
-  console.log(`${socket.user.name} connected`);
+  console.log(`✅ User connected: ${socket.user.name} (${socket.user.uniqueId})`);
+  onlineUsers.set(socket.user.uniqueId, socket.id);
 
   socket.on('send-message', async (data) => {
     const { toId, message } = data;
@@ -122,11 +166,9 @@ io.on('connection', (socket) => {
     await newMsg.save();
 
     // Send to recipient if online
-    const recipientSocket = Object.keys(users).find(
-      key => users[key].uniqueId === toId
-    );
-    if (recipientSocket) {
-      io.to(recipientSocket).emit('receive-message', {
+    const recipientSocketId = onlineUsers.get(toId);
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('receive-message', {
         fromId,
         message,
         timestamp: newMsg.timestamp
@@ -135,9 +177,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    delete users[socket.id];
+    console.log(`❌ User disconnected: ${socket.user?.uniqueId}`);
+    onlineUsers.delete(socket.user?.uniqueId);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
